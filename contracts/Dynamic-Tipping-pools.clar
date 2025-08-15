@@ -12,12 +12,15 @@
 (define-constant err-not-staff (err u105))
 (define-constant err-invalid-metric (err u106))
 (define-constant err-no-tips-available (err u107))
+(define-constant err-badge-not-found (err u108))
+(define-constant err-badge-already-earned (err u109))
 
 (define-data-var contract-enabled bool true)
 (define-data-var total-tip-pool uint u0)
 (define-data-var distribution-period uint u144)
 (define-data-var last-distribution-block uint u0)
 (define-data-var staff-count uint u0)
+(define-data-var badge-counter uint u0)
 
 (define-map staff-members
   { staff-id: principal }
@@ -59,6 +62,25 @@
     performance-bonus: uint,
     total-earned: uint,
     claimed: bool
+  }
+)
+
+(define-map performance-badges
+  { badge-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    requirement-type: (string-ascii 20),
+    threshold: uint,
+    created-block: uint
+  }
+)
+
+(define-map staff-badge-achievements
+  { staff-id: principal, badge-id: uint }
+  {
+    earned-block: uint,
+    performance-value: uint
   }
 )
 
@@ -290,5 +312,110 @@
         )
       )
     )
+  )
+)
+
+(define-public (create-badge 
+  (name (string-ascii 50)) 
+  (description (string-ascii 100)) 
+  (requirement-type (string-ascii 20)) 
+  (threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (> threshold u0) err-invalid-amount)
+    (let ((badge-id (+ (var-get badge-counter) u1)))
+      (map-set performance-badges
+        {badge-id: badge-id}
+        {
+          name: name,
+          description: description,
+          requirement-type: requirement-type,
+          threshold: threshold,
+          created-block: stacks-block-height
+        }
+      )
+      (var-set badge-counter badge-id)
+      (ok badge-id)
+    )
+  )
+)
+
+(define-public (check-and-award-badges (staff-id principal))
+  (begin
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (let 
+      (
+        (staff-data (unwrap! (map-get? staff-members {staff-id: staff-id}) err-not-found))
+        (current-period (get-current-period))
+        (performance-data (map-get? performance-metrics {staff-id: staff-id, period: current-period}))
+      )
+      (asserts! (get active staff-data) err-not-staff)
+      (match performance-data
+        some-performance
+        (let 
+          (
+            (badge-1 (check-badge-achievement staff-id u1 "total-score" (get total-score some-performance)))
+            (badge-2 (check-badge-achievement staff-id u2 "quality-score" (get quality-score some-performance)))
+            (badge-3 (check-badge-achievement staff-id u3 "orders-completed" (get orders-completed some-performance)))
+          )
+          (ok true)
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-private (check-badge-achievement (staff-id principal) (badge-id uint) (metric-type (string-ascii 20)) (metric-value uint))
+  (let 
+    (
+      (badge-data (map-get? performance-badges {badge-id: badge-id}))
+      (existing-achievement (map-get? staff-badge-achievements {staff-id: staff-id, badge-id: badge-id}))
+    )
+    (match badge-data
+      some-badge
+      (if (and 
+            (is-eq (get requirement-type some-badge) metric-type)
+            (>= metric-value (get threshold some-badge))
+            (is-none existing-achievement))
+        (begin
+          (map-set staff-badge-achievements
+            {staff-id: staff-id, badge-id: badge-id}
+            {
+              earned-block: stacks-block-height,
+              performance-value: metric-value
+            }
+          )
+          (ok true)
+        )
+        (ok false)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-read-only (get-staff-badges (staff-id principal))
+  (let ((achievement-1 (map-get? staff-badge-achievements {staff-id: staff-id, badge-id: u1}))
+        (achievement-2 (map-get? staff-badge-achievements {staff-id: staff-id, badge-id: u2}))
+        (achievement-3 (map-get? staff-badge-achievements {staff-id: staff-id, badge-id: u3})))
+    (list 
+      {badge-id: u1, achievement: achievement-1}
+      {badge-id: u2, achievement: achievement-2}  
+      {badge-id: u3, achievement: achievement-3}
+    )
+  )
+)
+
+(define-read-only (get-badge-info (badge-id uint))
+  (map-get? performance-badges {badge-id: badge-id})
+)
+
+(define-read-only (get-all-badges)
+  (list 
+    {badge-id: u1, badge-info: (map-get? performance-badges {badge-id: u1})}
+    {badge-id: u2, badge-info: (map-get? performance-badges {badge-id: u2})}
+    {badge-id: u3, badge-info: (map-get? performance-badges {badge-id: u3})}
   )
 )
