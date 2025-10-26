@@ -19,6 +19,7 @@
 (define-constant err-shift-not-started (err u112))
 (define-constant err-invalid-shift-time (err u113))
 (define-constant err-attendance-already-marked (err u114))
+(define-constant err-role-multiplier-not-set (err u115))
 
 (define-data-var contract-enabled bool true)
 (define-data-var total-tip-pool uint u0)
@@ -141,6 +142,11 @@
     staff-count: uint,
     distributed: bool
   }
+)
+
+(define-map role-multipliers
+  { role: (string-ascii 30) }
+  { multiplier: uint }
 )
 
 (define-public (toggle-contract)
@@ -270,16 +276,20 @@
         (staff-data (unwrap! (map-get? staff-members {staff-id: staff-id}) err-not-found))
         (performance-data (unwrap! (map-get? performance-metrics {staff-id: staff-id, period: period}) err-not-found))
         (distribution-data (unwrap! (map-get? tip-distributions {period: period}) err-not-found))
+        (staff-role (get role staff-data))
+        (role-mult-data (map-get? role-multipliers {role: staff-role}))
+        (role-multiplier (default-to u100 (get multiplier role-mult-data)))
         (base-share (/ (get total-amount distribution-data) (get staff-count distribution-data)))
+        (role-adjusted-share (/ (* base-share role-multiplier) u100))
         (performance-multiplier (calculate-performance-multiplier (get total-score performance-data)))
-        (performance-bonus (/ (* base-share performance-multiplier) u100))
-        (total-earned (+ base-share performance-bonus))
+        (performance-bonus (/ (* role-adjusted-share performance-multiplier) u100))
+        (total-earned (+ role-adjusted-share performance-bonus))
       )
       (asserts! (get active staff-data) err-not-staff)
       (map-set staff-earnings
         {staff-id: staff-id, period: period}
         {
-          base-share: base-share,
+          base-share: role-adjusted-share,
           performance-bonus: performance-bonus,
           total-earned: total-earned,
           claimed: false
@@ -324,6 +334,16 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (> new-period u0) err-invalid-amount)
     (ok (var-set distribution-period new-period))
+  )
+)
+
+(define-public (set-role-multiplier (role (string-ascii 30)) (multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (and (>= multiplier u50) (<= multiplier u300)) err-invalid-amount)
+    (map-set role-multipliers {role: role} {multiplier: multiplier})
+    (ok true)
   )
 )
 
@@ -813,4 +833,11 @@
                   none)
           none))
       none))
+)
+
+(define-read-only (get-role-multiplier (role (string-ascii 30)))
+  (default-to 
+    {multiplier: u100}
+    (map-get? role-multipliers {role: role})
+  )
 )
