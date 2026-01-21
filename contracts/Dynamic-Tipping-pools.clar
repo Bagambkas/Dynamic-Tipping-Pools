@@ -20,6 +20,9 @@
 (define-constant err-invalid-shift-time (err u113))
 (define-constant err-attendance-already-marked (err u114))
 (define-constant err-role-multiplier-not-set (err u115))
+(define-constant err-self-recognition (err u116))
+(define-constant err-daily-limit-reached (err u117))
+(define-constant err-cooldown-active (err u118))
 
 (define-data-var contract-enabled bool true)
 (define-data-var total-tip-pool uint u0)
@@ -32,6 +35,11 @@
 (define-data-var weekend-multiplier uint u125)
 (define-data-var holiday-multiplier uint u200)
 (define-data-var consistency-bonus uint u500)
+(define-data-var recognition-counter uint u0)
+(define-data-var recognition-bonus-pool uint u0)
+(define-data-var daily-recognition-limit uint u3)
+(define-data-var recognition-cooldown uint u10)
+(define-data-var recognition-reward uint u100)
 
 (define-map staff-members
   { staff-id: principal }
@@ -147,6 +155,38 @@
 (define-map role-multipliers
   { role: (string-ascii 30) }
   { multiplier: uint }
+)
+
+(define-map peer-recognitions
+  { recognition-id: uint }
+  {
+    from-staff: principal,
+    to-staff: principal,
+    category: (string-ascii 30),
+    message: (string-ascii 100),
+    block-height: uint,
+    reward-claimed: bool
+  }
+)
+
+(define-map staff-recognition-stats
+  { staff-id: principal }
+  {
+    recognitions-given: uint,
+    recognitions-received: uint,
+    last-recognition-block: uint,
+    daily-given-count: uint,
+    daily-reset-block: uint,
+    total-rewards-earned: uint
+  }
+)
+
+(define-map recognition-categories
+  { category: (string-ascii 30) }
+  {
+    bonus-multiplier: uint,
+    active: bool
+  }
 )
 
 (define-public (toggle-contract)
@@ -840,4 +880,178 @@
     {multiplier: u100}
     (map-get? role-multipliers {role: role})
   )
+)
+
+(define-public (create-recognition-category (category (string-ascii 30)) (bonus-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (and (>= bonus-multiplier u100) (<= bonus-multiplier u300)) err-invalid-amount)
+    (map-set recognition-categories
+      {category: category}
+      {bonus-multiplier: bonus-multiplier, active: true}
+    )
+    (ok true)
+  )
+)
+
+(define-public (give-recognition (to-staff principal) (category (string-ascii 30)) (message (string-ascii 100)))
+  (begin
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (not (is-eq tx-sender to-staff)) err-self-recognition)
+    (let 
+      (
+        (sender-data (unwrap! (map-get? staff-members {staff-id: tx-sender}) err-not-found))
+        (receiver-data (unwrap! (map-get? staff-members {staff-id: to-staff}) err-not-found))
+        (category-data (unwrap! (map-get? recognition-categories {category: category}) err-not-found))
+        (sender-stats (get-or-create-recognition-stats tx-sender))
+        (receiver-stats (get-or-create-recognition-stats to-staff))
+        (recognition-id (+ (var-get recognition-counter) u1))
+        (current-daily-count (get-daily-recognition-count tx-sender sender-stats))
+      )
+      (asserts! (get active sender-data) err-not-staff)
+      (asserts! (get active receiver-data) err-not-staff)
+      (asserts! (get active category-data) err-not-found)
+      (asserts! (< current-daily-count (var-get daily-recognition-limit)) err-daily-limit-reached)
+      (asserts! (>= (- stacks-block-height (get last-recognition-block sender-stats)) (var-get recognition-cooldown)) err-cooldown-active)
+      
+      (map-set peer-recognitions
+        {recognition-id: recognition-id}
+        {
+          from-staff: tx-sender,
+          to-staff: to-staff,
+          category: category,
+          message: message,
+          block-height: stacks-block-height,
+          reward-claimed: false
+        }
+      )
+      
+      (map-set staff-recognition-stats
+        {staff-id: tx-sender}
+        {
+          recognitions-given: (+ (get recognitions-given sender-stats) u1),
+          recognitions-received: (get recognitions-received sender-stats),
+          last-recognition-block: stacks-block-height,
+          daily-given-count: (+ current-daily-count u1),
+          daily-reset-block: (get-daily-reset-block sender-stats),
+          total-rewards-earned: (get total-rewards-earned sender-stats)
+        }
+      )
+      
+      (map-set staff-recognition-stats
+        {staff-id: to-staff}
+        (merge receiver-stats {recognitions-received: (+ (get recognitions-received receiver-stats) u1)})
+      )
+      
+      (var-set recognition-counter recognition-id)
+      (ok recognition-id)
+    )
+  )
+)
+
+(define-public (claim-recognition-reward (recognition-id uint))
+  (begin
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (let 
+      (
+        (recognition-data (unwrap! (map-get? peer-recognitions {recognition-id: recognition-id}) err-not-found))
+        (category-data (unwrap! (map-get? recognition-categories {category: (get category recognition-data)}) err-not-found))
+        (receiver-stats (get-or-create-recognition-stats (get to-staff recognition-data)))
+        (base-reward (var-get recognition-reward))
+        (multiplier (get bonus-multiplier category-data))
+        (final-reward (/ (* base-reward multiplier) u100))
+      )
+      (asserts! (is-eq tx-sender (get to-staff recognition-data)) err-not-staff)
+      (asserts! (not (get reward-claimed recognition-data)) err-already-exists)
+      (asserts! (>= (var-get recognition-bonus-pool) final-reward) err-insufficient-balance)
+      
+      (try! (as-contract (stx-transfer? final-reward tx-sender tx-sender)))
+      
+      (map-set peer-recognitions
+        {recognition-id: recognition-id}
+        (merge recognition-data {reward-claimed: true})
+      )
+      
+      (map-set staff-recognition-stats
+        {staff-id: tx-sender}
+        (merge receiver-stats {total-rewards-earned: (+ (get total-rewards-earned receiver-stats) final-reward)})
+      )
+      
+      (var-set recognition-bonus-pool (- (var-get recognition-bonus-pool) final-reward))
+      (ok final-reward)
+    )
+  )
+)
+
+(define-public (fund-recognition-pool (amount uint))
+  (begin
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (> amount u0) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set recognition-bonus-pool (+ (var-get recognition-bonus-pool) amount))
+    (ok true)
+  )
+)
+
+(define-public (set-recognition-params (daily-limit uint) (cooldown uint) (reward uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> daily-limit u0) err-invalid-amount)
+    (asserts! (> reward u0) err-invalid-amount)
+    (var-set daily-recognition-limit daily-limit)
+    (var-set recognition-cooldown cooldown)
+    (var-set recognition-reward reward)
+    (ok true)
+  )
+)
+
+(define-private (get-or-create-recognition-stats (staff-id principal))
+  (default-to
+    {
+      recognitions-given: u0,
+      recognitions-received: u0,
+      last-recognition-block: u0,
+      daily-given-count: u0,
+      daily-reset-block: stacks-block-height,
+      total-rewards-earned: u0
+    }
+    (map-get? staff-recognition-stats {staff-id: staff-id})
+  )
+)
+
+(define-private (get-daily-recognition-count (staff-id principal) (stats {recognitions-given: uint, recognitions-received: uint, last-recognition-block: uint, daily-given-count: uint, daily-reset-block: uint, total-rewards-earned: uint}))
+  (if (>= (- stacks-block-height (get daily-reset-block stats)) u144)
+    u0
+    (get daily-given-count stats)
+  )
+)
+
+(define-private (get-daily-reset-block (stats {recognitions-given: uint, recognitions-received: uint, last-recognition-block: uint, daily-given-count: uint, daily-reset-block: uint, total-rewards-earned: uint}))
+  (if (>= (- stacks-block-height (get daily-reset-block stats)) u144)
+    stacks-block-height
+    (get daily-reset-block stats)
+  )
+)
+
+(define-read-only (get-recognition-info (recognition-id uint))
+  (map-get? peer-recognitions {recognition-id: recognition-id})
+)
+
+(define-read-only (get-staff-recognition-stats (staff-id principal))
+  (map-get? staff-recognition-stats {staff-id: staff-id})
+)
+
+(define-read-only (get-recognition-category (category (string-ascii 30)))
+  (map-get? recognition-categories {category: category})
+)
+
+(define-read-only (get-recognition-pool-stats)
+  {
+    pool-balance: (var-get recognition-bonus-pool),
+    total-recognitions: (var-get recognition-counter),
+    daily-limit: (var-get daily-recognition-limit),
+    cooldown-blocks: (var-get recognition-cooldown),
+    base-reward: (var-get recognition-reward)
+  }
 )
